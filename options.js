@@ -325,8 +325,14 @@
         if (container) {
           const index = parseInt(container.getAttribute('data-index')) - 1;
           if (index >= 0) {
-            // Small delay to ensure the value is saved
-            setTimeout(() => loadLabelsForServer(index), 100);
+            const urlInput = container.querySelector('input[name="url"]');
+            const passInput = container.querySelector('input[name="pass"]');
+            
+            // Only validate if we have both URL and password
+            if (urlInput.value && passInput.value && URLregexp.test(urlInput.value)) {
+              // Always try to load labels - the function will handle validation first
+              loadLabelsForServer(index);
+            }
           }
         }
       }
@@ -401,51 +407,58 @@
       return;
     }
 
-    console.log('Fetching labels for server:', serverIndex, 'URL:', urlInput.value);
+    // Validate credentials - this will also update labels if valid
+    validateServerCredentials(container, urlInput.value, passInput.value);
+  }
 
-    // Get server info and plugin info in parallel
-    Promise.all([
-      new Promise((resolve) => {
-        safeSendMessage({
-          method: 'get-server-info'
-        }, function(response) {
-          console.log('Server info response:', response);
-          resolve(response);
-        });
-      }),
-      new Promise((resolve) => {
-        safeSendMessage({
-          method: 'plugins-getinfo',
-          url: urlInput.value,
-          password: passInput.value
-        }, function(response) {
-          console.log('Plugin info response:', response);
-          resolve(response);
-        });
-      }),
-      new Promise((resolve) => {
-        chrome.storage.local.get('server_default_labels', function(data) {
-          console.log('Server default labels response:', data);
-          resolve(data.server_default_labels || {});
-        });
-      })
-    ]).then(([serverResponse, pluginResponse, serverLabels]) => {
-      console.log('Got all initial data:', {
-        servers: serverResponse,
-        plugins: pluginResponse,
-        serverLabels: serverLabels
+  // Validate server credentials
+  function validateServerCredentials(container, url, password) {
+    return new Promise((resolve) => {
+      // Test connection with explicit credentials
+      safeSendMessage({
+        method: 'plugins-getinfo',  // Use plugins-getinfo directly as our auth test
+        url: url,
+        password: password,
+        force_check: true  // Force a fresh connection check
+      }, function(response) {
+        console.log('Validation response:', response);
+        
+        // Consider it valid if we get a successful plugins response
+        const isValid = response && response.value && !response.error;
+        
+        if (!isValid) {
+          container.classList.add('invalid-credentials');
+          
+          // Clear the label select since credentials are invalid
+          const labelSelect = container.querySelector('.default-label-select');
+          if (labelSelect) {
+            labelSelect.innerHTML = '<option value="">Invalid credentials</option>';
+            labelSelect.disabled = true;
+          }
+          
+          resolve(false);
+        } else {
+          container.classList.remove('invalid-credentials');
+          
+          // Update labels since we already have the data
+          const labelSelect = container.querySelector('.default-label-select');
+          if (labelSelect) {
+            const serverIndex = parseInt(container.getAttribute('data-index')) - 1;
+            updateLabelsFromResponse(labelSelect, response, serverIndex);
+          }
+          
+          resolve(true);
+        }
       });
+    });
+  }
 
-      if (!pluginResponse || pluginResponse.error) {
-        console.error('Error loading labels:', pluginResponse?.error || 'No response');
-        labelSelect.innerHTML = '<option value="">Failed to load labels</option>';
-        labelSelect.disabled = true;
-        return;
-      }
-
+  // Helper function to update labels from a plugin response
+  function updateLabelsFromResponse(labelSelect, response, serverIndex) {
+    chrome.storage.local.get('server_default_labels', function(data) {
+      const serverLabels = data.server_default_labels || {};
       const defaultLabel = serverLabels[serverIndex] || '';
-      const labels = pluginResponse?.value?.plugins?.Label || [];
-      console.log('Available labels:', labels);
+      const labels = response?.value?.plugins?.Label || [];
 
       if (labels.length === 0) {
         labelSelect.innerHTML = '<option value="">No labels available</option>';
@@ -459,10 +472,6 @@
         `;
       }
       labelSelect.disabled = false;
-    }).catch(error => {
-      console.error('Error fetching data:', error);
-      labelSelect.innerHTML = '<option value="">Failed to load labels</option>';
-      labelSelect.disabled = true;
     });
   }
 

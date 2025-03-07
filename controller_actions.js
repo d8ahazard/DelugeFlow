@@ -271,26 +271,32 @@ DelugeConnection.prototype._getNotificationId = function(torrent_url) {
 };
 
 /* Promise helpers */
-DelugeConnection.prototype._connect = function(silent) {
+DelugeConnection.prototype._connect = function(silent, isValidating = false) {
+  this._isValidating = isValidating;
+  
   // Always ensure state is initialized first
   return this._initState()
     .then(() => {
       debugLog('log', 'State initialized:', {
         SERVER_URL: this.SERVER_URL,
-        CONNECTION_INFO: this.CONNECTION_INFO
+        CONNECTION_INFO: this.CONNECTION_INFO,
+        isValidating: this._isValidating
       });
       
       if (!this.SERVER_URL) {
         return Promise.reject(new Error('Server URL not set after initialization'));
       }
       
-      return this._getSession()
-        .catch(() => this._doLogin(silent))
+      return this._doLogin(silent)
         .then(() => this._checkDaemonConnection())
         .catch(() => this._getDaemons()
           .then(daemons => this._getConnectedDaemon(daemons))
         )
-        .then(() => this._getServerConfig());
+        .then(() => this._getServerConfig())
+        .finally(() => {
+          // Reset validation flag
+          this._isValidating = false;
+        });
     });
 };
 
@@ -558,36 +564,47 @@ DelugeConnection.prototype._doLogin = function(silent) {
     debugLog('error', '[_doLogin] No password available');
     return Promise.reject(new Error('No password available'));
   }
-  
-  return this._request('auth.login', {
-    method: 'auth.login',
-    params: [this.SERVER_PASS],
-    id: '-17000.' + Date.now()
-  }, silent).then(payload => {
-    debugLog('log', '[_doLogin] Login response:', payload?.result ? 'Success' : 'Failed');
-    
-    if (payload.result) {
-      // Check for any cookies or CSRF tokens in the response headers
-      // (This would be handled in the _request method now)
+
+  // First check if we have an existing session
+  return this._request('auth.check_session', {
+    method: 'auth.check_session'
+  }, true)
+    .then(payload => {
+      // If we have a valid session and we're doing validation, delete it first
+      if (payload.result === true && this._isValidating) {
+        debugLog('log', '[_doLogin] Found existing session, deleting for validation');
+        return this._deleteSession();
+      }
+    })
+    .catch(() => {
+      // Ignore errors from check/delete session
+    })
+    .then(() => {
+      // Now try to login with the credentials
+      return this._request('auth.login', {
+        method: 'auth.login',
+        params: [this.SERVER_PASS],
+        id: '-17000.' + Date.now()
+      }, silent);
+    })
+    .then(payload => {
+      debugLog('log', '[_doLogin] Login response:', payload?.result ? 'Success' : 'Failed');
       
-      // Check that we can actually use the session
-      return this._getSession().then(() => {
-        debugLog('log', '[_doLogin] Successfully verified session after login');
+      if (payload.result) {
         return payload.result;
-      });
-    }
-    
-    if (!silent) {
-      notify({
-        message: 'Login failed',
-        contextMessage: 'Check your Deluge password in the extension options',
-        isClickable: true,
-        requireInteraction: true
-      }, -1, 'needs-settings', 'error');
-    }
-    
-    throw new Error('Login failed - check your Deluge password');
-  });
+      }
+      
+      if (!silent) {
+        notify({
+          message: 'Login failed',
+          contextMessage: 'Check your Deluge password in the extension options',
+          isClickable: true,
+          requireInteraction: true
+        }, -1, 'needs-settings', 'error');
+      }
+      
+      throw new Error('Login failed - check your Deluge password');
+    });
 };
 
 DelugeConnection.prototype._checkDaemonConnection = function() {
@@ -1311,21 +1328,35 @@ communicator
       switch(actiontype) {
         case 'getinfo':
           debugLog('log', 'Handling plugins-getinfo request');
-          // First connect and get both plugin info and server config
-          delugeConnection._connect(true)
+          
+          // Create a temporary connection if URL and password are provided
+          let connection = delugeConnection;
+          if (request.url && request.password) {
+            debugLog('log', 'Creating temporary connection for validation');
+            connection = new DelugeConnection();
+            connection.SERVER_URL = request.url;
+            connection.SERVER_PASS = request.password;
+          }
+
+          // If using existing connection and serverIndex is provided, connect to that server first
+          const promise = request.serverIndex !== undefined && !request.url
+            ? delugeConnection.connectToServer(request.serverIndex).then(() => delugeConnection._connect(true))
+            : connection._connect(true, true); // Pass true for isValidating
+
+          promise
             .then(() => {
               debugLog('log', 'Connected to server, getting data...');
               return Promise.all([
-                delugeConnection._request('web.get_plugins', {
+                connection._request('web.get_plugins', {
                   method: 'web.get_plugins'
                 }),
-                delugeConnection._request('core.get_config', {
+                connection._request('core.get_config', {
                   method: 'core.get_config'
                 }),
                 // Always try to get labels regardless of plugin list
-                delugeConnection._getLabelsWithFallbacks(),
+                connection._getLabelsWithFallbacks(),
                 // Try to get AutoAdd plugin paths if available
-                delugeConnection._request('autoadd.get_watchdirs', {
+                connection._request('autoadd.get_watchdirs', {
                   method: 'autoadd.get_watchdirs'
                 }).catch(err => {
                   debugLog('log', 'AutoAdd plugin not available:', err);
@@ -1537,5 +1568,14 @@ DelugeConnection.prototype.getAvailableServers = function() {
         primaryIndex: primaryIndex
       });
     });
+  });
+};
+
+DelugeConnection.prototype._deleteSession = function() {
+  return this._request('auth.delete_session', {
+    method: 'auth.delete_session'
+  }, true).catch(error => {
+    debugLog('warn', 'Error deleting session:', error);
+    // Don't throw, as we want to continue even if delete fails
   });
 };

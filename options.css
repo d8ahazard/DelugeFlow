@@ -203,6 +203,12 @@ select:focus {
   padding: 15px;
   margin-bottom: 15px;
   border: 1px solid var(--color-border);
+  transition: all 0.3s ease;
+}
+
+.connection-container.invalid-credentials {
+  background: rgba(219, 68, 55, 0.05);
+  border-color: rgba(219, 68, 55, 0.2);
 }
 
 .connection-row {
