@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+    <meta name="color-scheme" content="light dark">
+    <title>DelugeFlow Status</title>
+    <style>
+      * { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; font-size: 12px; }
+      body { margin: 0; padding: 10px; color: #333; background: #fff; }
+      h4 { margin: 3px 0 5px; padding: 0; }
+      #links { float: right; }
+      #title, #links > div { height: 16px; line-height: 16px; vertical-align: middle; }
+      #server-url, #options { float: right; }
+      #options { padding-left: 20px; background: url(images/options-16.png) 0 0 no-repeat; margin-right: 10px; }
+      #server-url { padding-left: 20px; background: url(images/login-16.png) 0 0 no-repeat; }
+      #title { padding-left: 20px; background: url(images/icon-16.png) 0 0 no-repeat; float: left; }
+      .hidden { display: none; }
+      body > div { width: 320px; }
+      a { color: #4285f4; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      
+      /* Support for dark mode */
+      @media (prefers-color-scheme: dark) {
+        body { 
+          background: #202124; 
+          color: #e8eaed; 
+        }
+        a { 
+          color: #8ab4f8; 
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div>
+      <h4>
+        <div id="title">DelugeFlow</div>
+        <div id="links">
+          <div id="server-url" class="hidden"><a id="server-url-link" target="_deluge_web" tabindex="-1" href="">Web UI</a></div>
+          <div id="options"><a href="options.html" id="opt-link" tabindex="-1" target="_blank">Options</a></div>
+        </div>
+      </h4>
+
+      <br clear="both"/>
+      <span id="reminder"></span>
+      
+      <!-- Torrents container will be added here by JavaScript -->
+    </div>
+    <script src="lib/logger.js"></script>
+    <script src="lib/utils.js"></script>
+    <script src="lib/controller_communicator.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>
