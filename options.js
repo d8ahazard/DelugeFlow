@@ -215,6 +215,12 @@
 
   // Initialize options page
   document.addEventListener('DOMContentLoaded', function() {
+    // Get manifest version and update titles
+    const manifest = chrome.runtime.getManifest();
+    const version = manifest.version;
+    document.title = `DelugeFlow v${version}`;
+    document.querySelector('h2').textContent = `DelugeFlow v${version}`;
+
     // Initialize communication first
     initCommunication().then(() => {
       console.log('Communication initialized successfully');

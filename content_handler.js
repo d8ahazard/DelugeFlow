@@ -174,7 +174,7 @@
           resolve();
         })
         .observeDisconnect(function() {
-          warn('Disconnect observer triggered');
+          log('Disconnect observer triggered');
           cleanup_handlers();
           if (!connected) {
             reject(new Error('Connection failed'));
