@@ -3,140 +3,204 @@
   const getEl = id => document.getElementById(id);
   
   // Elements we'll be working with
-  const serverUrlDiv = getEl('server-url');
-  const serverUrlLink = getEl('server-url-link');
+  const serverTabs = getEl('server-tabs');
+  const serverContainers = getEl('server-containers');
   const reminder = getEl('reminder');
-  const torrentsContainer = getEl('torrents') || document.createElement('div');
+  
+  // State management
+  let activeServerIndex = 0;
+  let servers = [];
+  let refreshTimers = {};
   
   // Refresh interval in milliseconds
   const REFRESH_INTERVAL = 3000;
-  let refreshTimer = null;
-  
-  // If torrents container doesn't exist, create and add it
-  if (!getEl('torrents')) {
-    torrentsContainer.id = 'torrents';
-    torrentsContainer.className = 'torrents-container';
-    document.querySelector('body > div').appendChild(torrentsContainer);
-    
-    // Add styles for torrent display
-    const style = document.createElement('style');
-    style.textContent = `
-      .torrents-container {
-        margin-top: 10px;
-        max-height: 300px;
-        overflow-y: auto;
-        border-top: 1px solid #ddd;
-        padding-top: 10px;
-      }
+  const MAX_VISIBLE_SERVERS = 3;
+
+  // Create styles for torrent display
+  const style = document.createElement('style');
+  style.textContent = `
+    .server-container {
+      display: none;
+    }
+    .server-container.active {
+      display: block;
+    }
+    .torrents-container {
+      margin-top: 10px;
+      max-height: 300px;
+      overflow-y: auto;
+      border-top: 1px solid #ddd;
+      padding-top: 10px;
+    }
+    .torrent-item {
+      margin-bottom: 8px;
+      padding: 8px;
+      border-radius: 4px;
+      background: #f5f5f5;
+    }
+    .torrent-name {
+      font-weight: bold;
+      margin-bottom: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .torrent-progress {
+      height: 4px;
+      background: #ddd;
+      border-radius: 2px;
+      margin: 4px 0;
+    }
+    .torrent-progress-bar {
+      height: 100%;
+      background: #4285f4;
+      border-radius: 2px;
+    }
+    .torrent-stats {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: #666;
+    }
+    .torrent-eta {
+      font-style: italic;
+    }
+    .no-torrents {
+      text-align: center;
+      color: #666;
+      padding: 10px;
+    }
+    @media (prefers-color-scheme: dark) {
       .torrent-item {
-        margin-bottom: 8px;
-        padding: 8px;
-        border-radius: 4px;
-        background: #f5f5f5;
-      }
-      .torrent-name {
-        font-weight: bold;
-        margin-bottom: 4px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        background: #333;
       }
       .torrent-progress {
-        height: 4px;
-        background: #ddd;
-        border-radius: 2px;
-        margin: 4px 0;
-      }
-      .torrent-progress-bar {
-        height: 100%;
-        background: #4285f4;
-        border-radius: 2px;
+        background: #555;
       }
       .torrent-stats {
-        display: flex;
-        justify-content: space-between;
-        font-size: 10px;
-        color: #666;
+        color: #bbb;
       }
-      .torrent-eta {
-        font-style: italic;
-      }
-      .no-torrents {
-        text-align: center;
-        color: #666;
-        padding: 10px;
-      }
-      @media (prefers-color-scheme: dark) {
-        .torrent-item {
-          background: #333;
-        }
-        .torrent-progress {
-          background: #555;
-        }
-        .torrent-stats {
-          color: #bbb;
-        }
-        .torrents-container {
-          border-top-color: #444;
-        }
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
-  function updateUI(serverUrl) {
-    if (serverUrl) {
-      serverUrlDiv.classList.remove('hidden');
-      serverUrlLink.href = serverUrl;
-      reminder.textContent = '';
-      
-      // Get torrent data if we have a valid server
-      fetchTorrentData();
-      
-      // Set up periodic refresh
-      if (!refreshTimer) {
-        refreshTimer = setInterval(() => {
-          fetchTorrentData();
-        }, REFRESH_INTERVAL);
-      }
-    } else {
-      serverUrlDiv.classList.add('hidden');
-      serverUrlLink.removeAttribute('href');
-      reminder.textContent = "Don't forget to configure your server info first!";
-      torrentsContainer.innerHTML = '';
-      
-      // Clear refresh timer if no server
-      if (refreshTimer) {
-        clearInterval(refreshTimer);
-        refreshTimer = null;
+      .torrents-container {
+        border-top-color: #444;
       }
     }
+  `;
+  document.head.appendChild(style);
+
+  function createServerTab(server, index) {
+    const tab = document.createElement('div');
+    tab.className = `server-tab ${index === activeServerIndex ? 'active' : ''}`;
+    tab.setAttribute('data-index', index);
+    
+    tab.innerHTML = `
+      <span class="server-name">Server ${index + 1}</span>
+      <a href="${server.url}" class="web-ui-link" target="_deluge_web" title="Open Web UI">⚙️</a>
+    `;
+    
+    tab.addEventListener('click', (e) => {
+      if (e.target.classList.contains('web-ui-link')) return; // Don't switch tabs when clicking web UI link
+      switchServer(index);
+    });
+    
+    return tab;
+  }
+
+  function createServerContainer(index) {
+    const container = document.createElement('div');
+    container.className = `server-container ${index === activeServerIndex ? 'active' : ''}`;
+    container.setAttribute('data-index', index);
+    
+    const torrentsContainer = document.createElement('div');
+    torrentsContainer.className = 'torrents-container';
+    container.appendChild(torrentsContainer);
+    
+    return container;
+  }
+
+  function switchServer(index) {
+    // Update active states
+    document.querySelectorAll('.server-tab').forEach(tab => {
+      tab.classList.toggle('active', parseInt(tab.getAttribute('data-index')) === index);
+    });
+    document.querySelectorAll('.server-container').forEach(container => {
+      container.classList.toggle('active', parseInt(container.getAttribute('data-index')) === index);
+    });
+    
+    activeServerIndex = index;
+    
+    // Stop all refresh timers and start only the active one
+    Object.keys(refreshTimers).forEach(key => {
+      clearInterval(refreshTimers[key]);
+      delete refreshTimers[key];
+    });
+    
+    // Start fetching data for the active server
+    if (servers[index]) {
+      fetchTorrentData(index);
+      refreshTimers[index] = setInterval(() => fetchTorrentData(index), REFRESH_INTERVAL);
+    }
+  }
+
+  function updateUI(serverConnections) {
+    servers = serverConnections || [];
+    
+    if (servers.length === 0) {
+      reminder.textContent = "Don't forget to configure your server info first!";
+      serverTabs.innerHTML = '';
+      serverContainers.innerHTML = '';
+      return;
+    }
+    
+    reminder.textContent = '';
+    
+    // Clear existing content
+    serverTabs.innerHTML = '';
+    serverContainers.innerHTML = '';
+    
+    // Create tabs and containers for up to MAX_VISIBLE_SERVERS
+    const visibleServers = servers.slice(0, MAX_VISIBLE_SERVERS);
+    visibleServers.forEach((server, index) => {
+      serverTabs.appendChild(createServerTab(server, index));
+      serverContainers.appendChild(createServerContainer(index));
+    });
+    
+    // Start data fetching for active server
+    switchServer(activeServerIndex);
   }
   
-  function fetchTorrentData() {
+  function fetchTorrentData(serverIndex) {
+    const server = servers[serverIndex];
+    if (!server) return;
+    
     communicator.sendMessage({
-      method: "torrent-list"
+      method: "torrent-list",
+      url: server.url,
+      password: server.pass
     }, response => {
       if (response && response.value) {
-        displayTorrents(response.value);
+        displayTorrents(response.value, serverIndex);
       } else {
-        torrentsContainer.innerHTML = '<div class="no-torrents">Could not retrieve torrent data</div>';
+        const container = document.querySelector(`.server-container[data-index="${serverIndex}"] .torrents-container`);
+        if (container) {
+          container.innerHTML = '<div class="no-torrents">Could not retrieve torrent data</div>';
+        }
       }
     });
   }
   
-  function displayTorrents(torrents) {
+  function displayTorrents(torrents, serverIndex) {
+    const container = document.querySelector(`.server-container[data-index="${serverIndex}"] .torrents-container`);
+    if (!container) return;
+    
     if (!torrents || torrents.length === 0) {
-      torrentsContainer.innerHTML = '<div class="no-torrents">No active torrents</div>';
+      container.innerHTML = '<div class="no-torrents">No active torrents</div>';
       return;
     }
     
     // Sort torrents: downloading first, then by progress
     torrents.sort((a, b) => {
-      // Downloading torrents first
       if (a.state === 'Downloading' && b.state !== 'Downloading') return -1;
       if (a.state !== 'Downloading' && b.state === 'Downloading') return 1;
-      // Then by progress
       return b.progress - a.progress;
     });
     
@@ -165,7 +229,7 @@
       `;
     }).join('');
     
-    torrentsContainer.innerHTML = html + 
+    container.innerHTML = html + 
       `<div class="no-torrents">Showing ${topTorrents.length} of ${torrents.length} torrents</div>`;
   }
   
@@ -199,11 +263,6 @@
     return `${remainingSeconds}s`;
   }
 
-  // Remove focus from links after clicking
-  document.querySelectorAll('a').forEach(link => {
-    link.addEventListener('click', e => e.target.blur());
-  });
-
   // Initialize communication and get server info
   communicator.observeConnect(() => {
     // Function to fetch and update server info
@@ -212,10 +271,9 @@
         method: "storage-get-connections"
       }, response => {
         try {
-          const serverUrl = response?.value?.[0]?.url;
-          updateUI(serverUrl);
+          updateUI(response?.value);
         } catch (e) {
-          debugLog('error', 'Error getting server URL:', e);
+          debugLog('error', 'Error getting server info:', e);
           updateUI(null);
         }
       });
@@ -226,10 +284,10 @@
     
     // Set up cleanup when popup closes
     window.addEventListener('unload', () => {
-      if (refreshTimer) {
-        clearInterval(refreshTimer);
-        refreshTimer = null;
-      }
+      Object.keys(refreshTimers).forEach(key => {
+        clearInterval(refreshTimers[key]);
+      });
+      refreshTimers = {};
     });
   }).init('popup');
 })();
