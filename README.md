@@ -7,6 +7,10 @@ DelugeFlow is a modern, feature-rich Chrome extension for seamlessly sending tor
 ## Key Features
 
 - **Chrome Manifest V3 Support**: Fully compatible with Chrome's latest extension manifest version
+- **Server Management**:
+  - Support for multiple Deluge servers
+  - Streamlined configuration
+  - Better connection status monitoring
 - **Modern UI/UX**: 
   - Clean, intuitive interface
   - Dark theme support
@@ -16,9 +20,6 @@ DelugeFlow is a modern, feature-rich Chrome extension for seamlessly sending tor
   - Comprehensive label support for better torrent organization
   - Improved error handling and user feedback
   - More detailed status information
-- **Quality of Life Improvements**:
-  - Streamlined configuration
-  - Better connection status monitoring
   - Enhanced error messages and debugging
 
 ## Credits
