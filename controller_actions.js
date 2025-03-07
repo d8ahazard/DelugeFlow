@@ -67,6 +67,7 @@ function DelugeConnection() {
   this.SERVER_PASS = null;
   this.server_config = {};
   this.plugin_info = {};
+  this.currentServerIndex = null;
 }
 
 DelugeConnection.prototype._initState = function() {
@@ -74,7 +75,7 @@ DelugeConnection.prototype._initState = function() {
     debugLog('warn', '_initState: Starting initialization');
 
     // Get connection info
-    chrome.storage.local.get('connections', data => {
+    chrome.storage.local.get(['connections', 'primaryServerIndex'], data => {
       try {
         // Parse connections if it's a string
         if (typeof data.connections === 'string') {
@@ -89,10 +90,18 @@ DelugeConnection.prototype._initState = function() {
         // Ensure connections is an array
         this.CONNECTION_INFO = Array.isArray(data.connections) ? data.connections : [];
         
-        // Set server URL and password from first connection
-        if (this.CONNECTION_INFO.length > 0) {
-          this.SERVER_URL = this.CONNECTION_INFO[0].url;
-          this.SERVER_PASS = this.CONNECTION_INFO[0].pass;
+        // Get primary server index
+        const primaryIndex = data.primaryServerIndex || 0;
+        
+        // If no server index specified, use primary
+        if (this.currentServerIndex === null) {
+          this.currentServerIndex = primaryIndex;
+        }
+        
+        // Set server URL and password from selected connection
+        if (this.CONNECTION_INFO.length > 0 && this.currentServerIndex < this.CONNECTION_INFO.length) {
+          this.SERVER_URL = this.CONNECTION_INFO[this.currentServerIndex].url;
+          this.SERVER_PASS = this.CONNECTION_INFO[this.currentServerIndex].pass;
         } else {
           this.SERVER_URL = null;
           this.SERVER_PASS = null;
@@ -100,7 +109,8 @@ DelugeConnection.prototype._initState = function() {
 
         debugLog('warn', '_initState: Initialization complete', {
           hasConnections: this.CONNECTION_INFO.length > 0,
-          hasServerUrl: !!this.SERVER_URL
+          hasServerUrl: !!this.SERVER_URL,
+          currentServerIndex: this.currentServerIndex
         });
 
         resolve({
@@ -115,6 +125,7 @@ DelugeConnection.prototype._initState = function() {
         this.CONNECTION_INFO = [];
         this.SERVER_URL = null;
         this.SERVER_PASS = null;
+        this.currentServerIndex = null;
         resolve({
           CONNECTION_INFO: [],
           SERVER_URL: null,
@@ -126,26 +137,43 @@ DelugeConnection.prototype._initState = function() {
 };
 
 /* public methods */
-DelugeConnection.prototype.connectToServer = function() {
+DelugeConnection.prototype.connectToServer = function(serverIndex) {
+  // If serverIndex is provided, set it as current
+  if (serverIndex !== undefined) {
+    this.currentServerIndex = serverIndex;
+  }
+  
   return this._initState().then(() => {
-  if (!this.SERVER_URL) {
-    notify({
-      message: 'Server URL is not set',
-      contextMessage: 'Click here to visit the options page!',
-      isClickable: true,
-      requireInteraction: true
-    }, -1, 'needs-settings', 'error');
+    if (!this.SERVER_URL) {
+      notify({
+        message: 'Server URL is not set',
+        contextMessage: 'Click here to visit the options page!',
+        isClickable: true,
+        requireInteraction: true
+      }, -1, 'needs-settings', 'error');
 
       return Promise.reject(new Error('Server URL not set'));
-  }
+    }
 
-  return this._connect();
+    return this._connect();
   });
 };
 
-DelugeConnection.prototype.addTorrent = function(url, cookies, plugins, options) {
-  debugLog('log', '[addTorrent] Called with:', url, cookies, plugins, options);
+DelugeConnection.prototype.addTorrent = function(url, cookies, plugins, options, serverIndex) {
+  debugLog('log', '[addTorrent] Called with:', url, cookies, plugins, options, serverIndex);
   
+  // If serverIndex is provided, connect to that server first
+  if (serverIndex !== undefined) {
+    return this.connectToServer(serverIndex).then(() => {
+      return this._addTorrentToCurrentServer(url, cookies, plugins, options);
+    });
+  }
+  
+  // Otherwise use current/primary server
+  return this._addTorrentToCurrentServer(url, cookies, plugins, options);
+};
+
+DelugeConnection.prototype._addTorrentToCurrentServer = function(url, cookies, plugins, options) {
   if (!this.SERVER_URL) {
     const error = new Error('SERVER_URL is not set. Please configure it in the options.');
     debugLog('error', '[addTorrent] Rejected due to missing SERVER_URL:', error);
@@ -1176,6 +1204,13 @@ communicator
           }
         });
       });
+    } else if (request.method === "get-server-info") {
+      debugLog('log', '~~~ MESSAGE ~~~ Get Server Info');
+      delugeConnection.getAvailableServers().then(serverInfo => {
+        debugLog('log', 'Server info retrieved:', serverInfo);
+        sendResponse(serverInfo);
+      });
+      return true;
     } else if (request.method === "notify") {
       debugLog('log', '~~~ MESSAGE ~~~ Send Notification');
       notify(request.opts, request.decay, 'content', request.type);
@@ -1299,10 +1334,12 @@ communicator
               ]);
             })
             .then(([pluginsPayload, configPayload, labels, autoaddPayload]) => {
-              debugLog('log', 'Raw plugin response:', pluginsPayload);
-              debugLog('log', 'Raw config response:', configPayload);
-              debugLog('log', 'Labels retrieved:', labels);
-              debugLog('log', 'AutoAdd paths:', autoaddPayload);
+              debugLog('log', 'Raw responses:', {
+                plugins: pluginsPayload,
+                config: configPayload,
+                labels: labels,
+                autoadd: autoaddPayload
+              });
               
               // Process the plugins list
               let enabledPlugins = [];
@@ -1336,11 +1373,11 @@ communicator
                 }
               };
               
-              debugLog('log', 'Sending final response structure:', response);
+              debugLog('log', 'Sending final plugin info response:', response);
               sendResponse(response);
             })
             .catch(error => {
-              debugLog('error', 'Failed to get data:', error);
+              debugLog('error', 'Failed to get plugin info:', error);
               sendResponse({
                 error: error.message,
                 value: {
@@ -1483,3 +1520,22 @@ chrome.runtime.onInstalled.addListener(install => {
   const manifest = chrome.runtime.getManifest();
   debugLog('log', '[INSTALLED: ' + manifest.version + ']', install);
 });
+
+// Add method to get available servers
+DelugeConnection.prototype.getAvailableServers = function() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['connections', 'primaryServerIndex'], data => {
+      const connections = Array.isArray(data.connections) ? data.connections : [];
+      const primaryIndex = data.primaryServerIndex || 0;
+      
+      resolve({
+        servers: connections.map((conn, index) => ({
+          url: conn.url,
+          isPrimary: index === primaryIndex,
+          index: index
+        })),
+        primaryIndex: primaryIndex
+      });
+    });
+  });
+};

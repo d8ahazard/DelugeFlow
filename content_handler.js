@@ -538,7 +538,7 @@
 
     // Show the modal immediately with loading state
     modal.innerHTML = `
-        <form action="javascript:void(0);">
+        <form action="javascript:void(0);" class="delugeflow-form">
             <h3>${req.info?.name || 'Add Torrent'}</h3>
             <div class="note">${req.url}</div>
             <input type="hidden" name="url" value="${req.url}"/>
@@ -551,241 +551,383 @@
     overlay.classList.add('displayed');
     log('Modal displayed with loading state');
 
-    // Get plugin info with timeout
-    log('Requesting plugin info...');
-    safeSendMessage({
-        method: 'plugins-getinfo'
-    }, function(response) {
-        log('Plugin info response received:', response);
-        
-        if (!response || response.error) {
-            warn('Plugin info request failed:', response?.error || 'No response');
-            renderModalContent({
-                plugins: {},
-                config: {},
-                defaultLabel: ''
-            });
-            return;
-        }
-
-        // Get default label if we have plugin data
-        if (response.value?.plugins?.Label?.length > 0) {
-            safeSendMessage({
-                method: 'storage-get-default_label'
-            }, function(labelResponse) {
-                log('Default label response received:', labelResponse);
-                const data = {
-                    ...response.value,
-                    defaultLabel: labelResponse?.value || ''
-                };
-                renderModalContent(data);
-            });
-        } else {
-            renderModalContent(response.value || {
-                plugins: {},
-                config: {},
-                defaultLabel: ''
-            });
-        }
+    // Get server info and plugin info in parallel
+    Promise.all([
+      new Promise((resolve) => {
+        safeSendMessage({
+          method: 'get-server-info'
+        }, function(response) {
+          log('Server info response:', response);
+          resolve(response);
+        });
+      }),
+      new Promise((resolve) => {
+        safeSendMessage({
+          method: 'plugins-getinfo'
+        }, function(response) {
+          log('Plugin info response:', response);
+          resolve(response);
+        });
+      }),
+      new Promise((resolve) => {
+        chrome.storage.local.get('server_default_labels', function(data) {
+          log('Server default labels response:', data);
+          resolve(data.server_default_labels || {});
+        });
+      })
+    ]).then(([serverResponse, pluginResponse, serverLabels]) => {
+      log('Got all initial data:', {
+        servers: serverResponse,
+        plugins: pluginResponse,
+        serverLabels: serverLabels
+      });
+      
+      // Get the primary server index
+      const primaryIndex = serverResponse?.primaryServerIndex || 0;
+      
+      // Combine the data and render
+      const data = {
+        servers: serverResponse?.servers || [],
+        primaryServerIndex: primaryIndex,
+        plugins: pluginResponse?.value?.plugins || {},
+        config: pluginResponse?.value?.config || {},
+        defaultLabel: serverLabels[primaryIndex] || ''
+      };
+      
+      log('Prepared data for rendering:', data);
+      renderModalContent(data);
+    }).catch(error => {
+      warn('Error fetching initial data:', error);
+      // Render with empty data if there's an error
+      renderModalContent({
+        servers: [],
+        primaryServerIndex: 0,
+        plugins: {},
+        config: {},
+        defaultLabel: ''
+      });
     });
 
     function renderModalContent(data) {
-        try {
-            log('Starting modal content render with:', data);
+      try {
+        log('Starting modal content render with:', data);
+        
+        // Extract plugin and config data
+        const plugins = data.plugins || {};
+        const config = data.config || {};
+        
+        modal.innerHTML = `
+          <form action="javascript:void(0);" class="delugeflow-form">
+            <h3>${req.info?.name || 'Add Torrent'}</h3>
+            <div class="note">${req.url}</div>
+            <input type="hidden" name="url" value="${req.url}"/>
             
-            modal.innerHTML = `
-                <form action="javascript:void(0);" class="delugeflow-form">
-                    <h3>${req.info?.name || 'Add Torrent'}</h3>
-                    <div class="note">${req.url}</div>
-                    <input type="hidden" name="url" value="${req.url}"/>
-                    
-                    ${data.plugins?.Label?.length > 0 ? `
-                    <div class="form-group">
-                        <label>Label:</label>
-                        <select name="plugins[Label]">
-                            <option value="">No Label</option>
-                            ${data.plugins.Label.map(label => 
-                                `<option value="${label}" ${label === data.defaultLabel ? 'selected' : ''}>${label}</option>`
-                            ).join('\n')}
-                        </select>
-                    </div>
-                    ` : ''}
-                    
-                    ${data.plugins?.AutoAdd?.length > 0 ? `
-                    <div class="form-group">
-                        <label>Watch Directory:</label>
-                        <select name="plugins[AutoAdd]">
-                            <option value="">Default Location</option>
-                            ${data.plugins.AutoAdd.map(path => 
-                                `<option value="${path}">${path}</option>`
-                            ).join('\n')}
-                        </select>
-                    </div>
-                    ` : ''}
-
-                    <div class="form-group">
-                        <label>Download Location:</label>
-                        <input type="text" name="options[download_location]" value="${data.config?.download_location || ''}"/>
-                    </div>
-
-                    <div class="form-group">
-                        <label>
-                            <input type="checkbox" name="options[add_paused]" ${data.config?.add_paused ? 'checked' : ''}/>
-                            Add Paused
-                        </label>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>
-                            <input type="checkbox" name="options[move_completed]" ${data.config?.move_completed ? 'checked' : ''}/>
-                            Move on Completion
-                        </label>
-                    </div>
-
-                    ${data.config?.move_completed ? `
-                    <div class="form-group">
-                        <label>Move Completed To:</label>
-                        <input type="text" name="options[move_completed_path]" value="${data.config?.move_completed_path || ''}"/>
-                    </div>
-                    ` : ''}
-                    
-                    <div class="actions">
-                        <button type="button" class="cancel">Cancel</button>
-                        <button type="submit">Add</button>
-                    </div>
-                </form>
-            `;
+            ${data.servers.length > 1 ? `
+            <div class="form-group">
+              <label>Server:</label>
+              <select name="server" class="server-select">
+                ${data.servers.map(server => 
+                  `<option value="${server.index}" ${server.isPrimary ? 'selected' : ''}>
+                    ${server.url}${server.isPrimary ? ' (Primary)' : ''}
+                  </option>`
+                ).join('\n')}
+              </select>
+            </div>
+            ` : ''}
             
-            log('Modal content rendered, setting up event listeners...');
-            setupModalEventListeners();
+            ${plugins.Label?.length > 0 ? `
+            <div class="form-group">
+              <label>Label:</label>
+              <select name="plugins[Label]">
+                <option value="">No Label</option>
+                ${plugins.Label.map(label => 
+                  `<option value="${label}" ${label === data.defaultLabel ? 'selected' : ''}>${label}</option>`
+                ).join('\n')}
+              </select>
+            </div>
+            ` : ''}
             
-        } catch (e) {
-            warn('Error rendering modal content:', e);
-            modal.innerHTML = `
-                <form action="javascript:void(0);" class="delugeflow-form">
-                    <h3>Add Torrent</h3>
-                    <div class="note">${req.url}</div>
-                    <input type="hidden" name="url" value="${req.url}"/>
-                    <div class="form-group">
-                        <label>Error loading options. Add anyway?</label>
-                    </div>
-                    <div class="actions">
-                        <button type="button" class="cancel">Cancel</button>
-                        <button type="submit">Add</button>
-                    </div>
-                </form>
-            `;
-            setupModalEventListeners();
+            ${plugins.AutoAdd?.length > 0 ? `
+            <div class="form-group">
+              <label>Watch Directory:</label>
+              <select name="plugins[AutoAdd]">
+                <option value="">Default Location</option>
+                ${plugins.AutoAdd.map(path => 
+                  `<option value="${path}">${path}</option>`
+                ).join('\n')}
+              </select>
+            </div>
+            ` : ''}
+
+            <div class="form-group">
+              <label>Download Location:</label>
+              <input type="text" name="options[download_location]" value="${config.download_location || ''}"/>
+            </div>
+
+            <div class="form-group">
+              <label>
+                <input type="checkbox" name="options[add_paused]" ${config.add_paused ? 'checked' : ''}/>
+                Add Paused
+              </label>
+            </div>
+            
+            <div class="form-group">
+              <label>
+                <input type="checkbox" name="options[move_completed]" ${config.move_completed ? 'checked' : ''}/>
+                Move on Completion
+              </label>
+            </div>
+
+            <div class="form-group move-completed-path" style="display: ${config.move_completed ? 'block' : 'none'}">
+              <label>Move Completed To:</label>
+              <input type="text" name="options[move_completed_path]" value="${config.move_completed_path || ''}"/>
+            </div>
+            
+            <div class="actions">
+              <button type="button" class="cancel">Cancel</button>
+              <button type="submit">Add</button>
+            </div>
+          </form>
+        `;
+
+        // Add event listener for server selection change
+        const serverSelect = modal.querySelector('.server-select');
+        if (serverSelect) {
+          serverSelect.addEventListener('change', function() {
+            const selectedServerIndex = parseInt(this.value);
+            log('Server selection changed to:', selectedServerIndex);
+            
+            // Show loading state
+            const form = modal.querySelector('form');
+            const loadingDiv = document.createElement('div');
+            loadingDiv.className = 'loading-overlay';
+            loadingDiv.innerHTML = 'Loading server options...';
+            form.appendChild(loadingDiv);
+            
+            // Get server-specific default label
+            chrome.storage.local.get('server_default_labels', function(data) {
+              const serverLabels = data.server_default_labels || {};
+              const defaultLabel = serverLabels[selectedServerIndex] || '';
+              
+              // Get plugin info and configuration for the selected server
+              safeSendMessage({
+                method: 'plugins-getinfo',
+                serverIndex: selectedServerIndex
+              }, function(response) {
+                log('Got updated plugin info for server:', response);
+                
+                // Remove loading state
+                loadingDiv.remove();
+                
+                if (response.error) {
+                  showToast(`Error loading server options: ${response.error}`, 'error', 5000);
+                  return;
+                }
+                
+                const plugins = response.value?.plugins || {};
+                const config = response.value?.config || {};
+                
+                // Update label select if it exists
+                const labelSelect = modal.querySelector('select[name="plugins[Label]"]');
+                const labelGroup = labelSelect?.closest('.form-group');
+                if (labelGroup) {
+                  if (plugins.Label && plugins.Label.length > 0) {
+                    labelGroup.style.display = '';
+                    labelSelect.innerHTML = `
+                      <option value="">No Label</option>
+                      ${plugins.Label.map(label => 
+                        `<option value="${label}" ${label === defaultLabel ? 'selected' : ''}>${label}</option>`
+                      ).join('\n')}
+                    `;
+                  } else {
+                    labelGroup.style.display = 'none';
+                  }
+                }
+                
+                // Update AutoAdd (watch directory) select if it exists
+                const watchSelect = modal.querySelector('select[name="plugins[AutoAdd]"]');
+                const watchGroup = watchSelect?.closest('.form-group');
+                if (watchGroup) {
+                  if (plugins.AutoAdd && plugins.AutoAdd.length > 0) {
+                    watchGroup.style.display = '';
+                    watchSelect.innerHTML = `
+                      <option value="">Default Location</option>
+                      ${plugins.AutoAdd.map(path => 
+                        `<option value="${path}">${path}</option>`
+                      ).join('\n')}
+                    `;
+                  } else {
+                    watchGroup.style.display = 'none';
+                  }
+                }
+                
+                // Update download location
+                const downloadLocation = modal.querySelector('input[name="options[download_location]"]');
+                if (downloadLocation && config.download_location) {
+                  downloadLocation.value = config.download_location;
+                }
+                
+                // Update add paused checkbox
+                const addPaused = modal.querySelector('input[name="options[add_paused]"]');
+                if (addPaused) {
+                  addPaused.checked = config.add_paused || false;
+                }
+                
+                // Update move completed checkbox and path
+                const moveCompleted = modal.querySelector('input[name="options[move_completed]"]');
+                const moveCompletedPath = modal.querySelector('input[name="options[move_completed_path]"]');
+                const moveCompletedGroup = moveCompletedPath?.closest('.form-group');
+                
+                if (moveCompleted) {
+                  moveCompleted.checked = config.move_completed || false;
+                  if (moveCompletedGroup) {
+                    moveCompletedGroup.style.display = moveCompleted.checked ? '' : 'none';
+                  }
+                }
+                
+                if (moveCompletedPath && config.move_completed_path) {
+                  moveCompletedPath.value = config.move_completed_path;
+                }
+              });
+            });
+          });
+          
+          // Also handle move_completed checkbox changes
+          const moveCompleted = modal.querySelector('input[name="options[move_completed]"]');
+          const moveCompletedPath = modal.querySelector('input[name="options[move_completed_path]"]')?.closest('.form-group');
+          if (moveCompleted && moveCompletedPath) {
+            moveCompleted.addEventListener('change', function() {
+              moveCompletedPath.style.display = this.checked ? '' : 'none';
+            });
+          }
         }
+
+        setupModalEventListeners();
+      } catch (e) {
+        warn('Error rendering modal content:', e);
+        modal.innerHTML = `
+          <form action="javascript:void(0);" class="delugeflow-form">
+            <h3>Add Torrent</h3>
+            <div class="note">${req.url}</div>
+            <input type="hidden" name="url" value="${req.url}"/>
+            <div class="form-group">
+              <label>Error loading options. Add anyway?</label>
+            </div>
+            <div class="actions">
+              <button type="button" class="cancel">Cancel</button>
+              <button type="submit">Add</button>
+            </div>
+          </form>
+        `;
+        setupModalEventListeners();
+      }
     }
 
     function setupModalEventListeners() {
-        const form = modal.querySelector('form');
-        if (!form) return;
+      const form = modal.querySelector('form');
+      if (!form) return;
 
-        form.addEventListener('submit', function(e) {
-            e.preventDefault();
-            hideModal();
-            
-            const formData = new FormData(e.target);
-            const data = {
-                method: 'addlink-todeluge',
-                url: formData.get('url'),
-                domain: req.domain,
-                options: {},
-                plugins: {}
-            };
+      form.addEventListener('submit', function(e) {
+        e.preventDefault();
+        hideModal();
+        
+        const formData = new FormData(e.target);
+        const data = {
+          method: 'addlink-todeluge',
+          url: formData.get('url'),
+          domain: req.domain,
+          options: {},
+          plugins: {}
+        };
 
-            // Process options and plugins
-            for (let [key, value] of formData.entries()) {
-                if (key.startsWith('options[')) {
-                    const optionKey = key.match(/options\[(.*?)\]/)[1];
-                    data.options[optionKey] = value === 'on' ? true : value;
-                } else if (key.startsWith('plugins[')) {
-                    const pluginKey = key.match(/plugins\[(.*?)\]/)[1];
-                    if (value) {
-                        data.plugins[pluginKey] = value;
-                    }
-                }
-            }
-
-            // ADD THE FUCKING COOKIES
-            data.cookies = window.lastTorrentCookies;
-
-            log('Submitting form data:', data);
-
-            // Save selected label as default if one was chosen
-            if (data.plugins.Label) {
-                safeSendMessage({
-                    method: 'storage-set',
-                    key: 'default_label',
-                    value: data.plugins.Label
-                });
-            }
-
-            // Show a loading toast
-            const loadingToastId = showToast('Adding torrent to Deluge...', 'info', 0);
-
-            // Send the torrent add request
-            safeSendMessage(data, function(response) {
-                // Remove the loading toast
-                removeToast(loadingToastId);
-                
-                if (response?.error) {
-                    log('Error adding torrent:', response.error);
-                    
-                    // Check if it's the "already in session" case
-                    if (response.error.includes('already in session')) {
-                        log('Torrent already exists in session');
-                        showToast('Torrent already exists in Deluge', 'warning', 5000);
-                    } else {
-                        showToast(`Error adding torrent: ${response.error}`, 'error', 5000);
-                    }
-                } else {
-                    log('Torrent added successfully');
-                    
-                    // Build success message with details
-                    let successMsg = 'Torrent added successfully';
-                    
-                    // Add label info if available
-                    if (data.plugins.Label) {
-                        successMsg += ` with label "${data.plugins.Label}"`;
-                    }
-                    
-                    // Add paused state if set
-                    if (data.options.add_paused) {
-                        successMsg += ' (paused)';
-                    }
-                    
-                    // Show success toast
-                    showToast(successMsg, 'success', 5000);
-                }
-            });
-        });
-
-        // Handle cancel button
-        const cancelBtn = form.querySelector('button.cancel');
-        if (cancelBtn) {
-            cancelBtn.addEventListener('click', hideModal);
+        // Get selected server if available
+        const serverSelect = form.querySelector('.server-select');
+        if (serverSelect) {
+          data.serverIndex = parseInt(serverSelect.value);
         }
 
-        // Handle overlay click
-        overlay.addEventListener('click', hideModal);
-        
-        // Handle escape key
-        document.addEventListener('keydown', function escapeHandler(e) {
-            if (e.key === 'Escape') {
-                hideModal();
-                document.removeEventListener('keydown', escapeHandler);
+        // Process options and plugins
+        for (let [key, value] of formData.entries()) {
+          if (key.startsWith('options[')) {
+            const optionKey = key.match(/options\[(.*?)\]/)[1];
+            data.options[optionKey] = value === 'on' ? true : value;
+          } else if (key.startsWith('plugins[')) {
+            const pluginKey = key.match(/plugins\[(.*?)\]/)[1];
+            if (value) {
+              data.plugins[pluginKey] = value;
             }
+          }
+        }
+
+        // ADD THE FUCKING COOKIES
+        data.cookies = window.lastTorrentCookies;
+
+        log('Submitting form data:', data);
+
+        // Save selected label as default if one was chosen
+        if (data.plugins.Label) {
+          safeSendMessage({
+            method: 'storage-set',
+            key: 'default_label',
+            value: data.plugins.Label
+          });
+        }
+
+        // Show a loading toast
+        const loadingToastId = showToast('Adding torrent to Deluge...', 'info', 0);
+
+        // Send the torrent add request
+        safeSendMessage(data, function(response) {
+          // Remove the loading toast
+          removeToast(loadingToastId);
+          
+          if (response?.error) {
+            log('Error adding torrent:', response.error);
+            
+            // Check if it's the "already in session" case
+            if (response.error.includes('already in session')) {
+              log('Torrent already exists in session');
+              showToast('Torrent already exists in Deluge', 'warning', 5000);
+            } else {
+              showToast(`Error adding torrent: ${response.error}`, 'error', 5000);
+            }
+          } else {
+            log('Torrent added successfully');
+            
+            // Build success message with details
+            let successMsg = 'Torrent added successfully';
+            
+            // Add label info if available
+            if (data.plugins.Label) {
+              successMsg += ` with label "${data.plugins.Label}"`;
+            }
+            
+            // Add paused state if set
+            if (data.options.add_paused) {
+              successMsg += ' (paused)';
+            }
+            
+            // Show success toast
+            showToast(successMsg, 'success', 5000);
+          }
         });
+      });
+
+      // Handle cancel button
+      const cancelBtn = form.querySelector('button.cancel');
+      if (cancelBtn) {
+        cancelBtn.addEventListener('click', hideModal);
+      }
+
+      // Handle overlay click
+      overlay.addEventListener('click', hideModal);
     }
 
     function hideModal() {
-        log('Hiding modal');
-        modal.classList.remove('displayed');
-        overlay.classList.remove('displayed');
-        modal.innerHTML = '';
+      log('Hiding modal');
+      modal.classList.remove('displayed');
+      overlay.classList.remove('displayed');
+      modal.innerHTML = '';
     }
   }
 

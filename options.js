@@ -43,176 +43,557 @@
     ]
   };
 
-  // Save options to chrome.storage.local
-  function saveOptions() {
-    clearErrors();
-    document.getElementById('save_options').textContent = 'Saving...';
-    var hasError = false;
-    var connectionData = [];
-    var connContainers = document.querySelectorAll('#connection-info .connection-container');
-    connContainers.forEach(function(container) {
-      var urlInput = container.querySelector('input[name="url"]');
-      var passInput = container.querySelector('input[name="pass"]');
-      var urlVal = urlInput.value.trim();
-      var passVal = passInput.value;
-      // apply scrubber
-      urlVal = optionsConfig.CONNECTION_DEFAULTS[0].scrubber(urlVal);
-      // validate url
-      if(optionsConfig.CONNECTION_DEFAULTS[0].required && !urlVal) {
-        showError(urlInput, 'Required field.');
-        hasError = true;
-      } else if(!optionsConfig.CONNECTION_DEFAULTS[0].validate(urlVal)) {
-        showError(urlInput, optionsConfig.CONNECTION_DEFAULTS[0].validate_message);
-        hasError = true;
+  // Keep track of connections
+  var connections = [];
+  var primaryServerIndex = 0;
+  var serverLabels = {};  // Store labels for each server
+
+  // Communicator state
+  let isReconnecting = false;
+  let messageQueue = [];
+
+  // Initialize communicator and connection
+  async function initCommunication() {
+    return new Promise((resolve, reject) => {
+      console.log('Starting communication initialization');
+      
+      if (!communicator) {
+        console.warn('Communicator not available at init time');
+        reject(new Error('Communicator not available'));
+        return;
       }
-      connectionData.push({ url: urlVal, pass: passVal });
+
+      console.log('Setting up communicator observers');
+
+      // Set up observers before initializing
+      communicator
+        .observeConnect(function() {
+          console.log('Connect observer triggered');
+          connected = true;
+          clearTimeout(timeout);
+          processMessageQueue();
+          resolve();
+        })
+        .observeDisconnect(function() {
+          console.log('Disconnect observer triggered');
+          if (!connected) {
+            reject(new Error('Connection failed'));
+          } else if (!isReconnecting) {
+            reconnect();
+          }
+        });
+
+      let connected = false;
+      let retryCount = 0;
+      const maxRetries = 3;
+      const retryDelay = 1000;
+
+      function tryConnect() {
+        if (connected) return;
+        
+        try {
+          console.log('Attempting connection, try #' + (retryCount + 1));
+          communicator.init(true);
+          console.log('Communicator initialized');
+          
+          // Test communication channel
+          setTimeout(() => {
+            if (!connected) {
+              safeSendMessage({ method: 'storage-get-connections' }, function(response) {
+                console.log('Communication test response:', response);
+                if (response !== undefined) {
+                  console.log('Communication channel verified');
+                  connected = true;
+                  clearTimeout(timeout);
+                  resolve();
+                } else if (retryCount < maxRetries) {
+                  retryCount++;
+                  setTimeout(tryConnect, retryDelay);
+                }
+              });
+            }
+          }, 100);
+        } catch (e) {
+          console.warn('Error during connection attempt:', e);
+          if (retryCount < maxRetries) {
+            retryCount++;
+            setTimeout(tryConnect, retryDelay);
+          } else {
+            reject(new Error('Max retries reached'));
+          }
+        }
+      }
+
+      // Set timeout
+      const timeout = setTimeout(() => {
+        if (!connected) {
+          console.warn('Communication initialization timed out');
+          reject(new Error('Connection timeout'));
+        }
+      }, 5000);
+
+      // Start connection attempt
+      tryConnect();
     });
+  }
 
-    if(!hasError) {
-      // Save all data at once
-      var dataToSave = {
-        connections: connectionData
-      };
+  // Safe message sender that queues messages when disconnected
+  function safeSendMessage(message, callback) {
+    console.log('Attempting to send message:', message);
+    
+    if (!communicator || !communicator._Connected) {
+      console.warn('Connection not available, queueing message:', message);
+      messageQueue.push({ message, callback });
+      if (!isReconnecting) {
+        reconnect();
+      }
+      return;
+    }
 
-      // Add default options
-      optionsConfig.DEFAULTS.forEach(function(opt) {
-        var element = document.getElementById(opt.id);
-        if(element) {
-          dataToSave[opt.id] = element.type === 'checkbox' ? element.checked : element.value;
+    try {
+      console.log('Sending message via communicator:', message);
+      communicator.sendMessage(message, function(response) {
+        console.log('Received response from background:', response);
+        if (callback) {
+          callback(response);
+        }
+      }, function(error) {
+        console.error('Message send failed:', error);
+        messageQueue.push({ message, callback });
+        if (!isReconnecting) {
+          reconnect();
         }
       });
-
-      // Add label options
-      var defaultLabel = document.getElementById('default_label');
-      if(defaultLabel) {
-        dataToSave.default_label = defaultLabel.value;
+    } catch (e) {
+      console.error('Error sending message:', e);
+      messageQueue.push({ message, callback });
+      if (!isReconnecting) {
+        reconnect();
       }
-
-      // Save all data at once
-      chrome.storage.local.set(dataToSave, function() {
-        debugLog('important', 'Settings saved:', dataToSave);
-        // Verify the save by reading back
-        chrome.storage.local.get(null, function(allData) {
-          debugLog('debug', 'All settings after save:', allData);
-        });
-        document.getElementById('save_options').textContent = 'Save';
-        // Broadcast settings change
-        chrome.runtime.sendMessage(chrome.runtime.id, { method: 'settings-changed' });
-      });
-    } else {
-      document.getElementById('save_options').textContent = 'Save';
     }
   }
 
-  // Set option values from chrome.storage.local
-  function setOptionValues(defaults) {
-    defaults.forEach(function(opt) {
-      var element = document.getElementById(opt.id);
-      if(!element) return;
-      
-      chrome.storage.local.get(opt.id, function(data) {
-        var value = data[opt.id];
-        if(value === undefined) value = opt.def;
-        
-        if(element.type === 'checkbox') {
-          element.checked = (value === 'true' || value === true);
-        } else {
-          element.value = value;
-        }
-      });
-    });
-  }
-
-  // Restore settings from chrome.storage.local
-  function restoreOptions() {
-    // Restore connection info
-    chrome.storage.local.get('connections', function(data) {
-      var connections = [{}];
+  // Process queued messages
+  function processMessageQueue() {
+    while (messageQueue.length > 0 && communicator && communicator._Connected) {
+      const { message, callback } = messageQueue.shift();
       try {
-        if(data.connections) {
-          connections = Array.isArray(data.connections) ? data.connections : [{}];
-        }
-      } catch(e) {
-        connections = [{}];
+        communicator.sendMessage(message, callback);
+      } catch (e) {
+        console.warn('Error processing queued message:', e);
+        messageQueue.unshift({ message, callback }); // Put it back at the start
+        break;
       }
-      
-      var connContainer = document.getElementById('connection-info');
-      connContainer.innerHTML = '';
-      connections.forEach(function(conn, index) {
-        var el = renderConnectionTemplate(index, conn.url, conn.pass);
-        connContainer.appendChild(el);
+    }
+  }
+
+  // Attempt to reconnect
+  function reconnect() {
+    if (isReconnecting) return;
+    isReconnecting = true;
+    
+    console.log('Attempting to reconnect...');
+    
+    // Reset communicator state
+    if (communicator) {
+      communicator._Connected = false;
+      communicator._port = null;
+    }
+
+    // Try to reinitialize
+    initCommunication().then(() => {
+      isReconnecting = false;
+      console.log('Reconnection successful');
+      processMessageQueue();
+    }).catch(e => {
+      isReconnecting = false;
+      console.warn('Reconnection failed:', e);
+      // Try again after a delay
+      setTimeout(reconnect, 2000);
+    });
+  }
+
+  // Initialize options page
+  document.addEventListener('DOMContentLoaded', function() {
+    // Initialize communication first
+    initCommunication().then(() => {
+      console.log('Communication initialized successfully');
+      // Load all options
+      loadOptions();
+    }).catch(e => {
+      console.error('Failed to initialize communication:', e);
+      // Still load options but show error state
+      loadOptions();
+      document.querySelectorAll('.default-label-select').forEach(select => {
+        select.innerHTML = '<option value="">Communication Error</option>';
+        select.disabled = true;
       });
     });
 
-    // Restore default options
-    setOptionValues(optionsConfig.DEFAULTS);
+    // Set up accordion functionality
+    document.querySelectorAll('.accordion-header').forEach(header => {
+      header.addEventListener('click', () => {
+        const content = header.nextElementSibling;
+        const isExpanded = content.classList.contains('expanded');
+        
+        // Toggle this accordion
+        content.classList.toggle('expanded');
+        header.classList.toggle('expanded');
+        
+        // Store the state
+        const accordionId = header.querySelector('h2').textContent.toLowerCase();
+        chrome.storage.local.get('accordion_states', function(data) {
+          const states = data.accordion_states || {};
+          states[accordionId] = !isExpanded;
+          chrome.storage.local.set({ accordion_states: states });
+        });
+      });
+    });
 
-    // For labels, if needed, we call communicator to get label info
-    communicator.sendMessage({ method: 'plugins-getinfo' }, function(response) {
-      var labels = response.value?.plugins?.Label || null;
-      var labelsContainer = document.getElementById('labels-options');
-      labelsContainer.innerHTML = '';
-      if(labels) {
-        if(labels.length > 0) {
-          var html = '<h3>Default Label</h3>' +
-                     '<div class="select opts"><select id="default_label" class="option_field"><option value=""></option>';
-          labels.forEach(function(label) {
-            html += '<option value="' + label + '">' + label + '</option>';
-          });
-          html += '</select><br><span><small>Apply this label to all new torrents by default</small></span></div>';
-          labelsContainer.innerHTML = html;
-          // Set stored default label
-          chrome.storage.local.get('default_label', function(data) {
-            if(data.default_label) {
-              document.getElementById('default_label').value = data.default_label;
-            }
-          });
-        } else {
-          labelsContainer.innerHTML = '<p>You have not created any labels. Visit your server\'s Web UI to make some.</p>';
+    // Restore accordion states
+    chrome.storage.local.get('accordion_states', function(data) {
+      const states = data.accordion_states || { 
+        'options': true,  // Default expanded
+        'advanced': false // Default collapsed
+      };
+      
+      document.querySelectorAll('.accordion-header').forEach(header => {
+        const accordionId = header.querySelector('h2').textContent.toLowerCase();
+        if (states[accordionId]) {
+          header.classList.add('expanded');
+          header.nextElementSibling.classList.add('expanded');
         }
-      } else {
-        labelsContainer.innerHTML = '<p>Labels plugin not enabled. Visit your server\'s Web UI to enable them.</p>';
+      });
+    });
+
+    // Set up event listeners
+    document.getElementById('add-server').addEventListener('click', addNewServer);
+
+    // Set up event delegation for connection list
+    document.getElementById('connection-list').addEventListener('click', function(e) {
+      const target = e.target;
+      const container = target.closest('.connection-container');
+      if (!container) return;
+
+      if (target.classList.contains('remove')) {
+        removeServer(container);
+      } else if (target.classList.contains('primary-toggle')) {
+        setPrimaryServer(container);
       }
     });
-  }
 
-  // Clear all stored settings
-  function clearOptions() {
-    chrome.storage.local.clear(function() {
-      restoreOptions();
-      chrome.runtime.sendMessage(chrome.runtime.id, { method: 'settings-changed' });
+    // Set up event delegation for default label changes
+    document.getElementById('connection-list').addEventListener('change', function(e) {
+      const target = e.target;
+      if (target.classList.contains('default-label-select')) {
+        const serverIndex = parseInt(target.getAttribute('data-server-index')) - 1;
+        const selectedLabel = target.value;
+        
+        // Save the default label for this server
+        chrome.storage.local.get('server_default_labels', function(data) {
+          const labels = data.server_default_labels || {};
+          if (selectedLabel) {
+            labels[serverIndex] = selectedLabel;
+          } else {
+            delete labels[serverIndex];
+          }
+          chrome.storage.local.set({ server_default_labels: labels });
+        });
+      }
+    });
+
+    // Set up event listeners for all option fields
+    document.querySelectorAll('.option_field').forEach(function(field) {
+      if (field.name !== 'url' && field.name !== 'pass' && !field.classList.contains('default-label-select')) {
+        field.addEventListener('change', saveOptions);
+      }
+    });
+
+    // Set up event delegation for connection fields
+    document.getElementById('connection-list').addEventListener('change', function(e) {
+      const target = e.target;
+      if (target.classList.contains('option_field') && !target.classList.contains('default-label-select')) {
+        validateAndSaveConnections();
+      }
+    });
+
+    // Add event listener for URL/password changes to reload labels
+    document.getElementById('connection-list').addEventListener('change', function(e) {
+      const target = e.target;
+      if (target.name === 'url' || target.name === 'pass') {
+        const container = target.closest('.connection-container');
+        if (container) {
+          const index = parseInt(container.getAttribute('data-index')) - 1;
+          if (index >= 0) {
+            // Small delay to ensure the value is saved
+            setTimeout(() => loadLabelsForServer(index), 100);
+          }
+        }
+      }
+    });
+  });
+
+  // Load all options from storage
+  function loadOptions() {
+    chrome.storage.local.get(null, function(data) {
+      // Load connections
+      if (data.connections) {
+        try {
+          connections = Array.isArray(data.connections) ? data.connections : [];
+          primaryServerIndex = data.primaryServerIndex || 0;
+          renderConnections();
+
+          // After rendering connections, load labels for each server
+          connections.forEach((conn, index) => {
+            loadLabelsForServer(index);
+          });
+        } catch (e) {
+          console.error('Error loading connections:', e);
+          connections = [];
+          primaryServerIndex = 0;
+        }
+      }
+
+      // If no connections exist, add one empty one
+      if (connections.length === 0) {
+        addNewServer();
+      }
+
+      // Load other options
+      optionsConfig.DEFAULTS.forEach(function(option) {
+        var el = document.getElementById(option.id);
+        if (el) {
+          if (el.type === 'checkbox') {
+            el.checked = data[option.id] !== undefined ? data[option.id] : option.def;
+          } else {
+            el.value = data[option.id] !== undefined ? data[option.id] : option.def;
+          }
+        }
+      });
     });
   }
 
-  // Utility function to create an element from an HTML string
-  function createElementFromHTML(htmlString) {
-    var div = document.createElement('div');
-    div.innerHTML = htmlString.trim();
-    return div.firstChild;
+  // Load labels for a specific server
+  function loadLabelsForServer(serverIndex) {
+    const container = document.querySelector(`.connection-container[data-index="${serverIndex + 1}"]`);
+    if (!container) {
+      console.log('No container found for server index:', serverIndex);
+      return;
+    }
+
+    const labelSelect = container.querySelector('.default-label-select');
+    if (!labelSelect) {
+      console.log('No label select found in container');
+      return;
+    }
+
+    // Show loading state
+    labelSelect.innerHTML = '<option value="">Loading labels...</option>';
+    labelSelect.disabled = true;
+
+    // First ensure we have valid connection details
+    const urlInput = container.querySelector('input[name="url"]');
+    const passInput = container.querySelector('input[name="pass"]');
+    if (!urlInput || !urlInput.value || !URLregexp.test(urlInput.value)) {
+      console.log('Invalid URL for server:', serverIndex, urlInput?.value);
+      labelSelect.innerHTML = '<option value="">Please enter valid server URL</option>';
+      labelSelect.disabled = true;
+      return;
+    }
+
+    console.log('Fetching labels for server:', serverIndex, 'URL:', urlInput.value);
+
+    // Get server info and plugin info in parallel
+    Promise.all([
+      new Promise((resolve) => {
+        safeSendMessage({
+          method: 'get-server-info'
+        }, function(response) {
+          console.log('Server info response:', response);
+          resolve(response);
+        });
+      }),
+      new Promise((resolve) => {
+        safeSendMessage({
+          method: 'plugins-getinfo',
+          url: urlInput.value,
+          password: passInput.value
+        }, function(response) {
+          console.log('Plugin info response:', response);
+          resolve(response);
+        });
+      }),
+      new Promise((resolve) => {
+        chrome.storage.local.get('server_default_labels', function(data) {
+          console.log('Server default labels response:', data);
+          resolve(data.server_default_labels || {});
+        });
+      })
+    ]).then(([serverResponse, pluginResponse, serverLabels]) => {
+      console.log('Got all initial data:', {
+        servers: serverResponse,
+        plugins: pluginResponse,
+        serverLabels: serverLabels
+      });
+
+      if (!pluginResponse || pluginResponse.error) {
+        console.error('Error loading labels:', pluginResponse?.error || 'No response');
+        labelSelect.innerHTML = '<option value="">Failed to load labels</option>';
+        labelSelect.disabled = true;
+        return;
+      }
+
+      const defaultLabel = serverLabels[serverIndex] || '';
+      const labels = pluginResponse?.value?.plugins?.Label || [];
+      console.log('Available labels:', labels);
+
+      if (labels.length === 0) {
+        labelSelect.innerHTML = '<option value="">No labels available</option>';
+      } else {
+        // Update the select options
+        labelSelect.innerHTML = `
+          <option value="">No Label</option>
+          ${labels.map(label => 
+            `<option value="${label}" ${label === defaultLabel ? 'selected' : ''}>${label}</option>`
+          ).join('\n')}
+        `;
+      }
+      labelSelect.disabled = false;
+    }).catch(error => {
+      console.error('Error fetching data:', error);
+      labelSelect.innerHTML = '<option value="">Failed to load labels</option>';
+      labelSelect.disabled = true;
+    });
   }
 
-  // Renders the connection template
-  function renderConnectionTemplate(index, url, pass) {
-    var container = document.createElement('div');
-    container.className = 'connection-container';
-    container.setAttribute('data-index', index);
+  // Save all options to storage
+  function saveOptions() {
+    var options = {};
 
-    var html = '<div class="connection-index">Deluge Server ' + index + '</div>' +
-      '<h3>URL</h3>' +
-      '<div class="textinput opts">' +
-      '  <label>' +
-      '    <input type="text" name="url" size="60" class="option_field" value="' + (url || '') + '" />' +
-      '  </label>' +
-      '  <br/><span><small>ex: http://localhost/user/deluge</small></span>' +
-      '</div>' +
-      '<h3>WebUI Password</h3>' +
-      '<div class="textinput opts">' +
-      '  <label>' +
-      '    <input type="password" name="pass" size="40" class="option_field" value="' + (pass || '') + '" />' +
-      '  </label>' +
-      '</div>';
-    container.innerHTML = html;
-    return container;
+    // Save all regular options
+    optionsConfig.DEFAULTS.forEach(function(option) {
+      var el = document.getElementById(option.id);
+      if (el) {
+        options[option.id] = el.type === 'checkbox' ? el.checked : el.value;
+      }
+    });
+
+    // Save label options if available
+    var labelEl = document.getElementById('default_label');
+    if (labelEl) {
+      options.default_label = labelEl.value;
+    }
+
+    // Save to storage
+    chrome.storage.local.set(options);
+  }
+
+  // Add a new server connection
+  function addNewServer() {
+    connections.push({
+      url: '',
+      pass: ''
+    });
+    renderConnections();
+    validateAndSaveConnections();
+  }
+
+  // Remove a server connection
+  function removeServer(container) {
+    const index = parseInt(container.getAttribute('data-index')) - 1;
+    if (index >= 0 && index < connections.length) {
+      connections.splice(index, 1);
+      
+      // Update primary server index if needed
+      if (primaryServerIndex >= connections.length) {
+        primaryServerIndex = Math.max(0, connections.length - 1);
+      } else if (index < primaryServerIndex) {
+        primaryServerIndex--;
+      }
+
+      // Remove default label for this server
+      chrome.storage.local.get('server_default_labels', function(data) {
+        const labels = data.server_default_labels || {};
+        delete labels[index];
+        // Shift all higher indexes down
+        for (let i = index + 1; i < connections.length + 1; i++) {
+          if (labels[i]) {
+            labels[i-1] = labels[i];
+            delete labels[i];
+          }
+        }
+        chrome.storage.local.set({ server_default_labels: labels });
+      });
+
+      renderConnections();
+      validateAndSaveConnections();
+    }
+  }
+
+  // Set a server as primary
+  function setPrimaryServer(container) {
+    const index = parseInt(container.getAttribute('data-index')) - 1;
+    if (index >= 0 && index < connections.length) {
+      primaryServerIndex = index;
+      renderConnections();
+      validateAndSaveConnections();
+    }
+  }
+
+  // Render all connections
+  function renderConnections() {
+    const container = document.getElementById('connection-list');
+    container.innerHTML = '';
+
+    connections.forEach((conn, index) => {
+      const div = renderConnectionTemplate(index + 1, conn.url, conn.pass);
+      const isPrimary = index === primaryServerIndex;
+      
+      // Update template with primary status
+      const primaryBtn = div.querySelector('.primary-toggle');
+      if (primaryBtn) {
+        primaryBtn.classList.toggle('primary', isPrimary);
+        primaryBtn.classList.toggle('not-primary', !isPrimary);
+        primaryBtn.textContent = isPrimary ? 'Primary' : 'Make Primary';
+      }
+
+      container.appendChild(div);
+    });
+  }
+
+  // Validate and save all connections
+  function validateAndSaveConnections() {
+    clearErrors();
+    var isValid = true;
+
+    // Validate each connection
+    connections = Array.from(document.querySelectorAll('.connection-container')).map(container => {
+      const urlInput = container.querySelector('input[name="url"]');
+      const passInput = container.querySelector('input[name="pass"]');
+      const url = urlInput.value.trim();
+      const pass = passInput.value;
+
+      // Validate URL
+      if (!URLregexp.test(url)) {
+        showError(urlInput, 'Invalid server URL');
+        isValid = false;
+      }
+
+      return {
+        url: url,
+        pass: pass
+      };
+    });
+
+    if (isValid) {
+      // Save connections and primary server index
+      chrome.storage.local.set({
+        connections: connections,
+        primaryServerIndex: primaryServerIndex
+      });
+    }
+
+    return isValid;
   }
 
   // Show validation error message near an element
@@ -222,7 +603,6 @@
     if(existing) { existing.remove(); }
     var span = document.createElement('span');
     span.className = 'validation-message';
-    span.style.color = 'red';
     span.textContent = message;
     element.parentNode.appendChild(span);
   }
@@ -234,71 +614,38 @@
     });
   }
 
-  // Initialization: wire up event listeners
-  function init() {
-    restoreOptions();
-    document.getElementById('version').textContent = chrome.runtime.getManifest().version;
+  // Renders the connection template
+  function renderConnectionTemplate(index, url, pass) {
+    var container = document.createElement('div');
+    container.className = 'connection-container';
+    container.setAttribute('data-index', index);
 
-    // Event listeners for option fields
-    document.querySelectorAll('input.option_field, select.option_field').forEach(function(el) {
-      var eventType = (el.type === 'checkbox') ? 'change' : 'blur';
-      el.addEventListener(eventType, saveOptions);
-    });
+    var html = `
+      <div class="connection-row">
+        <div class="field-group">
+          <label for="url-${index}">Server URL</label>
+          <input type="text" id="url-${index}" name="url" class="option_field url-input" placeholder="http://localhost/user/deluge" value="${url || ''}" />
+        </div>
+        <div class="field-group">
+          <label for="pass-${index}">Password</label>
+          <input type="password" id="pass-${index}" name="pass" class="option_field pass-input" placeholder="WebUI Password" value="${pass || ''}" />
+        </div>
+        <div class="field-group">
+          <label for="label-${index}">Default Label</label>
+          <select id="label-${index}" name="default_label" class="option_field default-label-select" data-server-index="${index}">
+            <option value="">No Label</option>
+          </select>
+        </div>
+        <div class="field-group controls-group">
+          <label class="server-label">Server ${index}</label>
+          <div class="connection-controls">
+            <button type="button" class="primary-toggle">Make Primary</button>
+            <button type="button" class="remove">Remove</button>
+          </div>
+        </div>
+      </div>`;
 
-    // Special handler for leftclick enabling link_regex
-    var leftclick = document.getElementById('enable_leftclick');
-    var linkRegex = document.getElementById('link_regex');
-    if(leftclick && linkRegex) {
-      leftclick.addEventListener('change', function() {
-        linkRegex.disabled = !leftclick.checked;
-      });
-      linkRegex.disabled = !leftclick.checked;
-    }
-
-    // Reset button
-    var resetBtn = document.getElementById('reset_options');
-    if(resetBtn) {
-      resetBtn.addEventListener('click', function(e) {
-        e.preventDefault();
-        clearOptions();
-      });
-    }
-
-    // Save button
-    var saveBtn = document.getElementById('save_options');
-    if(saveBtn) {
-      saveBtn.addEventListener('click', saveOptions);
-    }
-
-    // Manage extension click
-    var manage = document.getElementById('manage_extension');
-    if(manage) {
-      manage.addEventListener('click', function(e) {
-        e.preventDefault();
-        chrome.tabs.create({ url: 'chrome://extensions/?id=' + chrome.runtime.id });
-      });
-    }
-
-    // Initialize accordions
-    document.querySelectorAll('.accordion-header').forEach(function(header) {
-      header.addEventListener('click', function() {
-        const isExpanded = header.classList.contains('expanded');
-        const content = header.nextElementSibling;
-        
-        if (isExpanded) {
-          header.classList.remove('expanded');
-          content.classList.remove('expanded');
-        } else {
-          header.classList.add('expanded');
-          content.classList.add('expanded');
-        }
-      });
-    });
+    container.innerHTML = html;
+    return container;
   }
-
-  // Initialize when communicator connects
-  communicator.observeConnect(function() {
-    init();
-  }).init(!!chrome.runtime.id);
-
 })();
