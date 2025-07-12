@@ -365,8 +365,13 @@
       log('Regex match result:', torrent_match);
       
       if (!torrent_match) {
+        // Fallback: check if it's a magnet link
+        if (val.startsWith('magnet:')) {
+          log('URL is a magnet link, using as fallback');
+          torrent_match = { input: val };
+        }
         // Fallback: check if it ends with .torrent
-        if (val.endsWith('.torrent')) {
+        else if (val.endsWith('.torrent')) {
           log('URL ends with .torrent, using as fallback');
           torrent_match = { input: val };
         }
@@ -410,7 +415,7 @@
   function handle_keyup ( /*e*/ ) {
     if (CONTROL_KEY_DEPRESSED) {
       log('Control key released');
-    Control_KEY_DEPRESSED = false;
+    CONTROL_KEY_DEPRESSED = false;
     }
   }
 

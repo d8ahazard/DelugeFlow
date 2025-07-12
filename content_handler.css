@@ -396,3 +396,44 @@
   transform: translateX(100%) !important;
   opacity: 0 !important;
 }
+
+/* Magnet link styles */
+.delugeflow-magnet-link {
+  color: #0066cc !important;
+  text-decoration: underline !important;
+  cursor: pointer !important;
+  background: rgba(0, 102, 204, 0.1) !important;
+  padding: 2px 4px !important;
+  border-radius: 3px !important;
+  font-family: monospace !important;
+  font-size: 0.9em !important;
+  transition: background-color 0.2s ease !important;
+  display: inline !important;
+  word-break: break-all !important;
+}
+
+.delugeflow-magnet-link:hover {
+  background: rgba(0, 102, 204, 0.2) !important;
+  color: #004499 !important;
+}
+
+.delugeflow-magnet-link:active {
+  background: rgba(0, 102, 204, 0.3) !important;
+}
+
+/* Dark mode styles for magnet links */
+@media (prefers-color-scheme: dark) {
+  .delugeflow-magnet-link {
+    color: #8ab4f8 !important;
+    background: rgba(138, 180, 248, 0.1) !important;
+  }
+
+  .delugeflow-magnet-link:hover {
+    background: rgba(138, 180, 248, 0.2) !important;
+    color: #aecbfa !important;
+  }
+
+  .delugeflow-magnet-link:active {
+    background: rgba(138, 180, 248, 0.3) !important;
+  }
+}

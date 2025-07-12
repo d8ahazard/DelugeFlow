@@ -68,6 +68,9 @@ function DelugeConnection() {
   this.server_config = {};
   this.plugin_info = {};
   this.currentServerIndex = null;
+  this.SESSION_COOKIE = null;
+  this.SESSION_ID = null;
+  this.CSRF_TOKEN = null;
 }
 
 DelugeConnection.prototype._initState = function() {
@@ -343,6 +346,9 @@ DelugeConnection.prototype._request = function(state, params, silent) {
   if (this.SESSION_COOKIE) {
     debugLog('log', '[_request] Adding session cookie to request');
     headers['Cookie'] = this.SESSION_COOKIE;
+  } else if (this.SESSION_ID) {
+    debugLog('log', '[_request] Adding session ID as cookie to request');
+    headers['Cookie'] = `_session_id=${this.SESSION_ID}`;
   }
   
   if (this.CSRF_TOKEN) {
@@ -387,6 +393,13 @@ DelugeConnection.prototype._request = function(state, params, silent) {
       if (setCookie) {
         debugLog('log', '[_request] Received cookies from server');
         this.SESSION_COOKIE = setCookie;
+        
+        // Extract session ID from Set-Cookie header for Deluge
+        const sessionMatch = setCookie.match(/_session_id=([^;]+)/);
+        if (sessionMatch) {
+          this.SESSION_ID = sessionMatch[1];
+          debugLog('log', '[_request] Extracted session ID:', this.SESSION_ID);
+        }
       }
       
       // Store CSRF token if provided
@@ -431,7 +444,23 @@ DelugeConnection.prototype._request = function(state, params, silent) {
       // Handle authentication errors
       if (this._isAuthError(payload)) {
         debugLog('log', '[_request] Authentication error detected, attempting to re-authenticate');
-        return this._getSession().then(() => this._request(state, params, silent));
+        
+        // Prevent infinite retry loops
+        if (params.isRetry) {
+          debugLog('error', '[_request] Authentication retry failed, giving up');
+          throw new Error('Authentication failed after retry');
+        }
+        
+        // Clear session state and retry login
+        this.SESSION_COOKIE = null;
+        this.SESSION_ID = null;
+        this.CSRF_TOKEN = null;
+        
+        return this._doLogin(silent).then(() => {
+          // Mark this as a retry to prevent infinite loops
+          const retryParams = { ...params, isRetry: true };
+          return this._request(state, retryParams, silent);
+        });
       }
 
       // Update state if provided
@@ -565,45 +594,57 @@ DelugeConnection.prototype._doLogin = function(silent) {
     return Promise.reject(new Error('No password available'));
   }
 
-  // First check if we have an existing session
-  return this._request('auth.check_session', {
-    method: 'auth.check_session'
-  }, true)
-    .then(payload => {
-      // If we have a valid session and we're doing validation, delete it first
-      if (payload.result === true && this._isValidating) {
-        debugLog('log', '[_doLogin] Found existing session, deleting for validation');
-        return this._deleteSession();
+  // For validation, always start fresh by clearing session
+  const loginPromise = this._isValidating 
+    ? this._deleteSession().catch(() => {}) // Ignore delete errors
+    : this._request('auth.check_session', { method: 'auth.check_session' }, true)
+        .then(payload => {
+          if (payload.result === true) {
+            debugLog('log', '[_doLogin] Valid session already exists');
+            return true; // Session is valid, no need to login
+          }
+          return false; // Need to login
+        })
+        .catch(() => false); // Assume need to login on error
+
+  return loginPromise
+    .then(hasValidSession => {
+      if (hasValidSession && !this._isValidating) {
+        debugLog('log', '[_doLogin] Using existing valid session');
+        return true;
       }
-    })
-    .catch(() => {
-      // Ignore errors from check/delete session
-    })
-    .then(() => {
+      
+      // Clear any existing session state
+      this.SESSION_COOKIE = null;
+      this.SESSION_ID = null;
+      this.CSRF_TOKEN = null;
+      
       // Now try to login with the credentials
+      debugLog('log', '[_doLogin] Performing fresh login');
       return this._request('auth.login', {
         method: 'auth.login',
         params: [this.SERVER_PASS],
         id: '-17000.' + Date.now()
-      }, silent);
-    })
-    .then(payload => {
-      debugLog('log', '[_doLogin] Login response:', payload?.result ? 'Success' : 'Failed');
-      
-      if (payload.result) {
-        return payload.result;
-      }
-      
-      if (!silent) {
-        notify({
-          message: 'Login failed',
-          contextMessage: 'Check your Deluge password in the extension options',
-          isClickable: true,
-          requireInteraction: true
-        }, -1, 'needs-settings', 'error');
-      }
-      
-      throw new Error('Login failed - check your Deluge password');
+      }, silent)
+      .then(payload => {
+        debugLog('log', '[_doLogin] Login response:', payload?.result ? 'Success' : 'Failed');
+        
+        if (payload.result === true) {
+          debugLog('log', '[_doLogin] Login successful');
+          return payload.result;
+        }
+        
+        if (!silent) {
+          notify({
+            message: 'Login failed',
+            contextMessage: 'Check your Deluge password in the extension options',
+            isClickable: true,
+            requireInteraction: true
+          }, -1, 'needs-settings', 'error');
+        }
+        
+        throw new Error('Login failed - check your Deluge password');
+      });
     });
 };
 
@@ -953,17 +994,17 @@ DelugeConnection.prototype._addTorrentUrlToServer = function(url, options, cooki
     // Ensure URL is properly encoded if it's not a magnet link
     const encodedUrl = url.startsWith('magnet:') ? url : encodeURI(url);
     
-    // For magnet links, use URL method directly
+    // For magnet links, use the dedicated magnet API method
     if (url.startsWith('magnet:')) {
-        return this._addTorrentViaUrl(encodedUrl, params);
+        return this._addTorrentViaMagnet(encodedUrl, params);
     }
 
     // For non-magnet URLs, check if we should send cookies
     return new Promise((resolve, reject) => {
         chrome.storage.local.get('send_cookies', data => {
-            // If send_cookies is disabled, proceed without cookies
+            // If send_cookies is enabled, add cookies to the request
             if (data.send_cookies !== false) {
-                const cookieString = Object.entries(cookies)
+                const cookieString = Object.entries(cookies || {})
                     .map(([name, value]) => `${name}=${value}`)
                     .join('; ');
 
@@ -973,13 +1014,68 @@ DelugeConnection.prototype._addTorrentUrlToServer = function(url, options, cooki
                 } else {
                     debugLog('log', '[_addTorrentUrlToServer] No cookies to add');
                 }
-            
-              this._addTorrentViaUrl(encodedUrl, params)
-                      .then(resolve)
-                      .catch(reject);
-                  return;
+            } else {
+                debugLog('log', '[_addTorrentUrlToServer] Cookie sending is disabled');
             }
+            
+            // Always proceed with the request, with or without cookies
+            this._addTorrentViaUrl(encodedUrl, params)
+                .then(resolve)
+                .catch(reject);
         });
+    });
+};
+
+DelugeConnection.prototype._addTorrentViaMagnet = function(magnetUri, params) {
+    debugLog('log', '[_addTorrentViaMagnet] Adding magnet link:', magnetUri);
+    
+    return this._request('core.add_torrent_magnet', {
+        method: 'core.add_torrent_magnet',
+        params: [magnetUri, params],  // Magnet API takes URI and options
+        id: '-17002.' + Date.now()
+    })
+    .then(payload => {
+        debugLog('log', '[_addTorrentViaMagnet] Add magnet response:', payload);
+        
+        if (!payload) {
+            throw new Error('Empty response from server');
+        }
+        
+        if (payload.error) {
+            // Check if the server doesn't support the magnet API (older Deluge versions)
+            if (payload.error.message && 
+                (payload.error.message.includes('Unknown method') || 
+                 payload.error.message.includes('add_torrent_magnet'))) {
+                
+                debugLog('log', '[_addTorrentViaMagnet] Magnet API not supported, falling back to URL method');
+                
+                // Fallback to the URL method for older Deluge versions
+                return this._addTorrentViaUrl(magnetUri, params);
+            }
+            
+            // Handle other specific magnet-related errors
+            if (payload.error.message && payload.error.message.includes('Unsupported scheme')) {
+                debugLog('error', '[_addTorrentViaMagnet] Unsupported magnet scheme');
+                throw new Error('Invalid magnet link format - unsupported scheme');
+            }
+            
+            throw new Error(payload.error.message || 'Failed to add magnet link');
+        }
+        
+        if (payload.result === false) {
+            throw new Error('Server refused magnet link');
+        }
+        
+        // Success - return the torrent ID
+        return payload.result;
+    })
+    .catch(error => {
+        // If the magnet API fails completely, try the URL method as fallback
+        if (error.message && error.message.includes('Unknown method')) {
+            debugLog('log', '[_addTorrentViaMagnet] Falling back to URL method due to API error');
+            return this._addTorrentViaUrl(magnetUri, params);
+        }
+        throw error;
     });
 };
 
@@ -1070,10 +1166,14 @@ DelugeConnection.prototype._processPluginOptions = function(url, plugins, torren
 
 // Add the missing _isAuthError method
 DelugeConnection.prototype._isAuthError = function(payload) {
-  return payload.error && 
-         (payload.error.message?.includes('Not authenticated') || 
-          payload.error.message?.includes('Invalid session') ||
-          payload.error.message?.includes('No session exists'));
+  if (!payload.error) return false;
+  
+  const errorMessage = payload.error.message || '';
+  return errorMessage.includes('Not authenticated') || 
+         errorMessage.includes('Invalid session') ||
+         errorMessage.includes('No session exists') ||
+         errorMessage.includes('Authentication required') ||
+         errorMessage.includes('Session expired');
 };
 
 /* notification handling */
@@ -1108,26 +1208,48 @@ function createContextMenu(add, with_options) {
       + '|\\.torrent(\\?.*)?$';
 
     const regex = data.link_regex || defaultRegex;
+    // Use targeted patterns for common torrent sites
     const patterns = [
       'magnet:*',
       '*://*/*.torrent*',
       '*://*/*torrent*',
       '*://*/*download*',
-      '*://*/*get*'
+      '*://*/*get*',
+      '*://*/*.php*',
+      '*://*/*dl*',
+      '*://*/*tracker*',
+      '*://*/*announce*',
+      // Specific patterns for common torrent sites
+      '*://*/download.php/*',
+      '*://*/dl.php/*',
+      '*://*/get.php/*',
+      '*://*/*action=download*',
+      '*://*/*passkey=*',
+      '*://*/*authkey=*'
     ];
 
     // Convert regex to match patterns where possible
     try {
       const regexObj = new RegExp(regex);
-      // Add any custom patterns from the regex that can be converted to match patterns
-      // This is a basic conversion - you may want to enhance this
-      if (regex.includes('.php')) {
-        patterns.push('*://*/*.php*');
+      // Add more specific patterns based on the regex
+      if (regex.includes('download.php')) {
+        patterns.push('*://*/download.php*');
+      }
+      if (regex.includes('dl.php')) {
+        patterns.push('*://*/dl.php*');
+      }
+      if (regex.includes('get.php')) {
+        patterns.push('*://*/get.php*');
+      }
+      if (regex.includes('action=download')) {
+        patterns.push('*://*/*action=download*');
       }
     } catch (e) {
       console.warn('Invalid regex pattern:', e);
     }
 
+    debugLog('log', '[createContextMenu] Creating context menu with patterns:', patterns);
+    
     chrome.contextMenus.removeAll(() => {
       if (with_options) {
         chrome.contextMenus.create({
@@ -1135,6 +1257,25 @@ function createContextMenu(add, with_options) {
           title: 'Add with Options',
           contexts: ['link'],
           targetUrlPatterns: patterns
+        }, () => {
+          if (chrome.runtime.lastError) {
+            debugLog('error', '[createContextMenu] Error creating add-with-options menu:', chrome.runtime.lastError);
+          } else {
+            debugLog('log', '[createContextMenu] Successfully created add-with-options menu');
+          }
+        });
+        
+        // Also create context menu for text selection containing magnet links
+        chrome.contextMenus.create({
+          id: 'add-with-options-selection',
+          title: 'Add Magnet Link with Options',
+          contexts: ['selection']
+        }, () => {
+          if (chrome.runtime.lastError) {
+            debugLog('error', '[createContextMenu] Error creating add-with-options-selection menu:', chrome.runtime.lastError);
+          } else {
+            debugLog('log', '[createContextMenu] Successfully created add-with-options-selection menu');
+          }
         });
       }
 
@@ -1144,6 +1285,25 @@ function createContextMenu(add, with_options) {
           title: with_options ? 'Add' : 'Add to Deluge',
           contexts: ['link'],
           targetUrlPatterns: patterns
+        }, () => {
+          if (chrome.runtime.lastError) {
+            debugLog('error', '[createContextMenu] Error creating add menu:', chrome.runtime.lastError);
+          } else {
+            debugLog('log', '[createContextMenu] Successfully created add menu');
+          }
+        });
+        
+        // Also create context menu for text selection containing magnet links
+        chrome.contextMenus.create({
+          id: 'add-selection',
+          title: 'Add Magnet Link to Deluge',
+          contexts: ['selection']
+        }, () => {
+          if (chrome.runtime.lastError) {
+            debugLog('error', '[createContextMenu] Error creating add-selection menu:', chrome.runtime.lastError);
+          } else {
+            debugLog('log', '[createContextMenu] Successfully created add-selection menu');
+          }
         });
       }
     });
@@ -1152,14 +1312,39 @@ function createContextMenu(add, with_options) {
 
 // Handle context menu clicks
 chrome.contextMenus.onClicked.addListener((info, tab) => {
-  const torrentUrl = info.linkUrl;
+  debugLog('log', '[contextMenus.onClicked] Context menu clicked:', {
+    menuItemId: info.menuItemId,
+    linkUrl: info.linkUrl,
+    pageUrl: info.pageUrl,
+    selectionText: info.selectionText
+  });
+  
+  let torrentUrl = info.linkUrl;
+  
+  // For selection-based menus, extract magnet link from selected text
+  if (info.menuItemId.includes('selection') && info.selectionText) {
+    const magnetMatch = info.selectionText.match(/magnet:\?[^\s<>"]+/i);
+    if (magnetMatch) {
+      torrentUrl = magnetMatch[0];
+      debugLog('log', '[contextMenus.onClicked] Extracted magnet link from selection:', torrentUrl);
+    } else {
+      debugLog('warn', '[contextMenus.onClicked] No magnet link found in selection:', info.selectionText);
+      return;
+    }
+  }
+  
+  if (!torrentUrl) {
+    debugLog('warn', '[contextMenus.onClicked] No torrent URL found');
+    return;
+  }
+  
   const s1 = torrentUrl.indexOf('//') + 2;
   let domain = torrentUrl.substring(s1);
   
   const s2 = domain.indexOf('/');
   const cleanDomain = s2 >= 0 ? domain.substring(0, s2) : domain;
 
-  if (info.menuItemId === 'add-with-options') {
+  if (info.menuItemId === 'add-with-options' || info.menuItemId === 'add-with-options-selection') {
     // Send message to content script in the active tab
     chrome.tabs.sendMessage(tab.id, {
       method: 'add_dialog',
@@ -1178,7 +1363,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
         });
       }
     });
-  } else if (info.menuItemId === 'add') {
+  } else if (info.menuItemId === 'add' || info.menuItemId === 'add-selection') {
     // Get cookies and add torrent directly
     communicator.sendMessage({
       method: 'getCookies',
@@ -1192,8 +1377,12 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 
 // Initialize context menu based on settings
 chrome.storage.local.get(['enable_context_menu', 'enable_context_menu_with_options'], data => {
+  debugLog('log', '[contextMenu init] Context menu settings:', data);
   if (data.enable_context_menu) {
+    debugLog('log', '[contextMenu init] Context menu enabled, creating menus');
     createContextMenu(true, data.enable_context_menu_with_options);
+  } else {
+    debugLog('log', '[contextMenu init] Context menu disabled');
   }
 });
 
