@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "DelugeFlow",
   "short_name": "DelugeFlow",
-  "version": "0.73.1",
+  "version": "0.74.0",
   "default_locale": "en",
   "description": "Send torrent links to your Deluge server.",
   "homepage_url": "https://github.com/d8ahazard/DelugeFlow/",
