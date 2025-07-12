@@ -1199,82 +1199,20 @@ const notificationTimeouts = {};
 const delugeConnection = new DelugeConnection();
 
 function createContextMenu(add, with_options) {
-  // Get the regex pattern from storage or use default
-  chrome.storage.local.get('link_regex', function(data) {
-    const defaultRegex = '^magnet:'
-      + '|(\\/|^)(torrent|torrents|dl|download|get)(\\.php)?\\?(.*&)?action=download'
-      + '|(\\/|^)(torrent|torrents|dl|download|get)(\\.php)?\\/(\\d+|[a-f0-9]{32})'
-      + '|(\\/|^)(index|download)(\\.php)?(\\?|\\/).*\\.torrent'
-      + '|\\.torrent(\\?.*)?$';
-
-    const regex = data.link_regex || defaultRegex;
-    // Use targeted patterns for common torrent sites
-    const patterns = [
-      'magnet:*',
-      '*://*/*.torrent*',
-      '*://*/*torrent*',
-      '*://*/*download*',
-      '*://*/*get*',
-      '*://*/*.php*',
-      '*://*/*dl*',
-      '*://*/*tracker*',
-      '*://*/*announce*',
-      // Specific patterns for common torrent sites
-      '*://*/download.php/*',
-      '*://*/dl.php/*',
-      '*://*/get.php/*',
-      '*://*/*action=download*',
-      '*://*/*passkey=*',
-      '*://*/*authkey=*'
-    ];
-
-    // Convert regex to match patterns where possible
-    try {
-      const regexObj = new RegExp(regex);
-      // Add more specific patterns based on the regex
-      if (regex.includes('download.php')) {
-        patterns.push('*://*/download.php*');
-      }
-      if (regex.includes('dl.php')) {
-        patterns.push('*://*/dl.php*');
-      }
-      if (regex.includes('get.php')) {
-        patterns.push('*://*/get.php*');
-      }
-      if (regex.includes('action=download')) {
-        patterns.push('*://*/*action=download*');
-      }
-    } catch (e) {
-      console.warn('Invalid regex pattern:', e);
-    }
-
-    debugLog('log', '[createContextMenu] Creating context menu with patterns:', patterns);
-    
-    chrome.contextMenus.removeAll(() => {
+  debugLog('log', '[createContextMenu] Creating context menus for all links');
+  
+  chrome.contextMenus.removeAll(() => {
       if (with_options) {
         chrome.contextMenus.create({
           id: 'add-with-options',
           title: 'Add with Options',
-          contexts: ['link'],
-          targetUrlPatterns: patterns
+          contexts: ['link']
+          // No targetUrlPatterns - appears on ALL links, filtered in handler
         }, () => {
           if (chrome.runtime.lastError) {
             debugLog('error', '[createContextMenu] Error creating add-with-options menu:', chrome.runtime.lastError);
           } else {
             debugLog('log', '[createContextMenu] Successfully created add-with-options menu');
-          }
-        });
-        
-        // Also create context menu for text selection containing magnet links
-        chrome.contextMenus.create({
-          id: 'add-with-options-selection',
-          title: 'Add Magnet Link with Options',
-          contexts: ['selection']
-        }, () => {
-          if (chrome.runtime.lastError) {
-            debugLog('error', '[createContextMenu] Error creating add-with-options-selection menu:', chrome.runtime.lastError);
-          } else {
-            debugLog('log', '[createContextMenu] Successfully created add-with-options-selection menu');
           }
         });
       }
@@ -1283,8 +1221,8 @@ function createContextMenu(add, with_options) {
         chrome.contextMenus.create({
           id: 'add',
           title: with_options ? 'Add' : 'Add to Deluge',
-          contexts: ['link'],
-          targetUrlPatterns: patterns
+          contexts: ['link']
+          // No targetUrlPatterns - appears on ALL links, filtered in handler
         }, () => {
           if (chrome.runtime.lastError) {
             debugLog('error', '[createContextMenu] Error creating add menu:', chrome.runtime.lastError);
@@ -1292,22 +1230,8 @@ function createContextMenu(add, with_options) {
             debugLog('log', '[createContextMenu] Successfully created add menu');
           }
         });
-        
-        // Also create context menu for text selection containing magnet links
-        chrome.contextMenus.create({
-          id: 'add-selection',
-          title: 'Add Magnet Link to Deluge',
-          contexts: ['selection']
-        }, () => {
-          if (chrome.runtime.lastError) {
-            debugLog('error', '[createContextMenu] Error creating add-selection menu:', chrome.runtime.lastError);
-          } else {
-            debugLog('log', '[createContextMenu] Successfully created add-selection menu');
-          }
-        });
       }
     });
-  });
 }
 
 // Handle context menu clicks
@@ -1315,36 +1239,36 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   debugLog('log', '[contextMenus.onClicked] Context menu clicked:', {
     menuItemId: info.menuItemId,
     linkUrl: info.linkUrl,
-    pageUrl: info.pageUrl,
-    selectionText: info.selectionText
+    pageUrl: info.pageUrl
   });
   
-  let torrentUrl = info.linkUrl;
-  
-  // For selection-based menus, extract magnet link from selected text
-  if (info.menuItemId.includes('selection') && info.selectionText) {
-    const magnetMatch = info.selectionText.match(/magnet:\?[^\s<>"]+/i);
-    if (magnetMatch) {
-      torrentUrl = magnetMatch[0];
-      debugLog('log', '[contextMenus.onClicked] Extracted magnet link from selection:', torrentUrl);
-    } else {
-      debugLog('warn', '[contextMenus.onClicked] No magnet link found in selection:', info.selectionText);
-      return;
-    }
-  }
+  const torrentUrl = info.linkUrl;
   
   if (!torrentUrl) {
-    debugLog('warn', '[contextMenus.onClicked] No torrent URL found');
+    debugLog('warn', '[contextMenus.onClicked] No URL found');
     return;
   }
   
+  // Check if this is actually a torrent/magnet link
+  const isTorrentLink = torrentUrl.startsWith('magnet:') ||
+    torrentUrl.includes('.torrent') ||
+    torrentUrl.includes('download.php') ||
+    torrentUrl.includes('dl.php') ||
+    torrentUrl.includes('get.php') ||
+    torrentUrl.includes('action=download');
+
+  if (!isTorrentLink) {
+    debugLog('log', '[contextMenus.onClicked] Not a torrent/magnet link, ignoring:', torrentUrl);
+    return;
+  }
+
   const s1 = torrentUrl.indexOf('//') + 2;
   let domain = torrentUrl.substring(s1);
   
   const s2 = domain.indexOf('/');
   const cleanDomain = s2 >= 0 ? domain.substring(0, s2) : domain;
 
-  if (info.menuItemId === 'add-with-options' || info.menuItemId === 'add-with-options-selection') {
+  if (info.menuItemId === 'add-with-options') {
     // Send message to content script in the active tab
     chrome.tabs.sendMessage(tab.id, {
       method: 'add_dialog',
@@ -1363,7 +1287,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
         });
       }
     });
-  } else if (info.menuItemId === 'add' || info.menuItemId === 'add-selection') {
+  } else if (info.menuItemId === 'add') {
     // Get cookies and add torrent directly
     communicator.sendMessage({
       method: 'getCookies',
